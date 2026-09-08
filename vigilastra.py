@@ -80,6 +80,14 @@ def api_key():
     return os.getenv('NVD_API_KEY') or os.getenv('NVD_API') or ''
 
 
+def virustotal_key():
+    return os.getenv('VIRUSTOTAL_API_KEY') or os.getenv('Virus_Total') or ''
+
+
+def shodan_key():
+    return os.getenv('SHODAN_API_KEY') or os.getenv('Shodan') or ''
+
+
 def safe_text(value, limit=6000):
     """Bound untrusted content and remove control characters before rendering."""
     return ''.join(c for c in str(value) if c in '\n\t' or ord(c) >= 32)[:limit]
@@ -168,6 +176,10 @@ class Assessment:
     request_count: int = 0
     osv_status: str = 'Not run'
     kev_status: str = 'Not run'
+    virustotal_status: str = 'Not run'
+    shodan_status: str = 'Not run'
+    virustotal: dict = field(default_factory=dict)
+    shodan: dict = field(default_factory=dict)
     demo: bool = False
 
 
@@ -1339,6 +1351,173 @@ def enrich_kev(report):
         report.kev_status = 'Unavailable; exploitation status unknown'
 
 
+def enrich_virustotal(report):
+    key = virustotal_key()
+    if not key:
+        report.virustotal_status = 'API key not configured'
+        return
+    hostname = urlsplit(report.final_url).hostname
+    if not hostname:
+        report.virustotal_status = 'No hostname to query'
+        return
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            session.headers['x-apikey'] = key
+            response = session.get(f'https://www.virustotal.com/api/v3/domains/{hostname}',
+                                   timeout=(5, 15), allow_redirects=False)
+            if response.status_code == 404:
+                report.virustotal_status = f'{hostname}: not found in VirusTotal'
+                return
+            if response.status_code in (401, 403):
+                report.virustotal_status = 'VirusTotal rejected the request; check API key'
+                return
+            if response.status_code == 429:
+                report.virustotal_status = 'VirusTotal rate limit reached'
+                return
+            response.raise_for_status()
+            data = response.json().get('data', {}).get('attributes', {})
+        stats = data.get('last_analysis_stats', {})
+        malicious = stats.get('malicious', 0)
+        suspicious = stats.get('suspicious', 0)
+        harmless = stats.get('harmless', 0)
+        total = malicious + suspicious + harmless
+        reputation = data.get('reputation', 0)
+        tags = data.get('tags', [])
+        votes = data.get('total_votes', {})
+        report.virustotal = {
+            'hostname': hostname,
+            'malicious': malicious,
+            'suspicious': suspicious,
+            'harmless': harmless,
+            'total': total,
+            'reputation': reputation,
+            'tags': tags[:10],
+            'votes_malicious': votes.get('malicious', 0),
+            'votes_harmless': votes.get('harmless', 0),
+            'last_analysis_date': data.get('last_analysis_date'),
+            'registrar': data.get('registrar', ''),
+            'creation_date': data.get('creation_date'),
+        }
+        report.virustotal_status = f'{hostname}: {malicious} malicious, {suspicious} suspicious of {total} engines'
+        if malicious > 0 or suspicious > 0:
+            severity = 'High' if malicious >= 5 else 'Medium' if malicious >= 2 or suspicious >= 3 else 'Low'
+            record_finding(report, f'VirusTotal reputation alert for {hostname}', severity, 'Reputation',
+                f'VirusTotal analysis: {malicious} malicious / {suspicious} suspicious / {harmless} harmless engines.\n'
+                f'Community reputation score: {reputation}. Community votes: {votes.get("malicious", 0)} malicious, {votes.get("harmless", 0)} harmless.\n'
+                f'Tags: {", ".join(tags[:5]) if tags else "none"}.',
+                'Multiple security vendors have flagged this domain. Investigate whether the flags are false positives or genuine threats. '
+                'Reputation does not prove active exploitation of your specific deployment.',
+                f'# Investigate the VirusTotal community votes and scanner details.\n'
+                f'# Check for false positives by reviewing individual scanner reports.\n'
+                f'# If legitimate, submit corrections to misclassified scanners.\n'
+                f'# Monitor for changes in reputation over time.',
+                report.final_url, verification='VirusTotal domain intelligence',
+                references=[f'https://www.virustotal.com/gui/domain/{hostname}'])
+        report.notes.append(f'VirusTotal domain intelligence: {report.virustotal_status}.')
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        report.virustotal_status = 'VirusTotal query failed or timed out'
+        report.complete = False
+
+
+def enrich_shodan(report):
+    key = shodan_key()
+    if not key:
+        report.shodan_status = 'API key not configured'
+        return
+    hostname = urlsplit(report.final_url).hostname
+    if not hostname:
+        report.shodan_status = 'No hostname to query'
+        return
+    try:
+        addresses = list(dict.fromkeys(
+            x[4][0] for x in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+            if x[4][0]
+        ))
+        if not addresses:
+            report.shodan_status = f'{hostname}: no resolvable addresses'
+            return
+        ip = addresses[0]
+        ip_obj = ipaddress.ip_address(ip)
+        if not ip_obj.is_global:
+            report.shodan_status = 'Target resolves to a private address; Shodan query skipped'
+            return
+    except OSError:
+        report.shodan_status = f'{hostname}: DNS resolution failed'
+        return
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(f'https://api.shodan.io/shodan/host/{ip}',
+                                   params={'key': key}, timeout=(5, 15), allow_redirects=False)
+            if response.status_code == 404:
+                report.shodan_status = f'{ip}: no Shodan records'
+                return
+            if response.status_code in (401, 403):
+                report.shodan_status = 'Shodan rejected the request; check API key'
+                return
+            if response.status_code == 429:
+                report.shodan_status = 'Shodan rate limit reached'
+                return
+            response.raise_for_status()
+            data = response.json()
+        ports = data.get('ports', [])
+        org = data.get('org', '')
+        isp = data.get('isp', '')
+        os_info = data.get('os')
+        hostnames = data.get('hostnames', [])
+        country = data.get('country_name', '')
+        services = data.get('data', [])
+        vulns = set()
+        for svc in services:
+            svc_vulns = svc.get('vulns', [])
+            vulns.update(svc_vulns)
+        report.shodan = {
+            'ip': ip,
+            'ports': ports,
+            'org': org,
+            'isp': isp,
+            'os': os_info,
+            'hostnames': hostnames[:10],
+            'country': country,
+            'vulns': list(vulns)[:20],
+            'service_count': len(services),
+            'banner_summary': [{'port': s.get('port'), 'product': s.get('product', ''),
+                                'version': s.get('version', ''), 'transport': s.get('transport', 'tcp')}
+                               for s in services[:15]],
+        }
+        report.shodan_status = f'{ip}: {len(ports)} open ports, {len(vulns)} vulnerabilities'
+        unexpected_ports = [p for p in ports if p not in (80, 443, 8080, 8443)]
+        if unexpected_ports:
+            record_finding(report, f'Shodan: unexpected open ports on {ip}', 'Low', 'Infrastructure',
+                f'Shodan reports {len(ports)} open ports: {", ".join(str(p) for p in sorted(ports))}.\n'
+                f'Unexpected ports (not 80/443): {", ".join(str(p) for p in sorted(unexpected_ports))}.\n'
+                f'Organization: {org}. ISP: {isp}. Country: {country}.',
+                'Unusual open ports may indicate additional services that increase attack surface. '
+                'Verify each port is intentional and properly firewalled.',
+                f'# Review each open port with the infrastructure team.\n'
+                f'# Ensure only required services are exposed.\n'
+                f'# Apply network-level access controls where possible.',
+                report.final_url, verification='Shodan host intelligence',
+                references=[f'https://www.shodan.io/host/{ip}'])
+        if vulns:
+            record_finding(report, f'Shodan: {len(vulns)} known vulnerabilities on {ip}', 'Medium', 'Infrastructure',
+                f'Shodan reports known CVEs on this host: {", ".join(sorted(vulns)[:10])}{"..." if len(vulns) > 10 else ""}.\n'
+                f'Services: {", ".join(s.get("product", "unknown") for s in services[:8] if s.get("product"))}.\n'
+                f'Organization: {org}. ISP: {isp}.',
+                'Known vulnerabilities on exposed services can be exploited by automated scanners. '
+                'Patch or remove affected services. Verify whether these CVEs apply to your specific deployment.',
+                f'# Update or remove the affected services.\n'
+                f'# Apply vendor patches for listed CVEs.\n'
+                f'# Restrict access via firewall rules where possible.',
+                report.final_url, verification='Shodan host intelligence',
+                references=[f'https://www.shodan.io/host/{ip}'])
+        report.notes.append(f'Shosted intelligence: {report.shodan_status}.')
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        report.shodan_status = 'Shodan query failed or timed out'
+        report.complete = False
+
+
 def openapi_seeds(data, base_url):
     """Import GET paths only; unresolved path parameters and secrets are never guessed."""
     if not isinstance(data, dict) or not isinstance(data.get('paths'), dict):
@@ -1580,6 +1759,10 @@ def audit(value, browser=True, progress=lambda message, fraction: None, options=
         progress('Cross-checking npm advisories with OSV', .85)
         enrich_osv(report)
         enrich_kev(report)
+        progress('Querying VirusTotal for domain reputation', .86)
+        enrich_virustotal(report)
+        progress('Querying Shodan for infrastructure intelligence', .87)
+        enrich_shodan(report)
     add_rule(report, 'Dependency intelligence', report.nvd_status, len(report.components), 'NVD CPE range matching; OSV npm corroboration: ' + report.osv_status)
     if not report.components:
         report.notes.append('No supported library versions were identified. Bundles and hidden/transitive dependencies require a lockfile or SBOM assessment.')
@@ -1699,7 +1882,7 @@ def build_pdf(report):
              p(f'{len(report.findings)} findings  /  {len(report.components)} identified component versions', 'SectionV'),
              p('Prioritize applicable component CVEs and transport weaknesses, then harden response policies. Findings reflect the observed response and published intelligence; they are not proof of successful exploitation.'),
              p('Unscored includes conditional CVE candidates and records without a published v3.1 score. Zero findings is not certification of security.', 'SmallV'),
-             p(f'Browser: {report.browser_status}\nIntelligence: {report.nvd_status}', 'SmallV'), PageBreak(),
+             p(f'Browser: {report.browser_status}\nIntelligence: {report.nvd_status}\nVirusTotal: {report.virustotal_status}\nShodan: {report.shodan_status}', 'SmallV'), PageBreak(),
              p('01 / Control coverage', 'SectionV'),
              table([['CONTROL', 'RESULT', 'OBSERVATION']] + [[x['Control'], x['Result'], x['Evidence']] for x in report.checks], [135, 64, 300]),
              Spacer(1, 15), p('Component inventory', 'SectionV')]
@@ -1710,6 +1893,21 @@ def build_pdf(report):
     if report.cookies:
         story += [Spacer(1, 12), p('Cookie metadata', 'SectionV'), table([['NAME / SOURCE', 'SECURE', 'HTTPONLY', 'SAMESITE']] +
                   [[c['Name'] + '\n' + c['Source'], str(c['Secure']), str(c['HttpOnly']), c['SameSite']] for c in report.cookies], [244, 75, 80, 100])]
+    if report.virustotal or report.shodan:
+        story += [Spacer(1, 12), p('External Threat Intelligence', 'SectionV')]
+        intel_rows = []
+        if report.virustotal:
+            vt = report.virustotal
+            intel_rows.append(['VirusTotal Domain Report',
+                               f"Malicious: {vt.get('malicious', 0)}\nSuspicious: {vt.get('suspicious', 0)}\nHarmless: {vt.get('harmless', 0)}",
+                               f"Reputation: {vt.get('reputation', 0)}\nVotes: {vt.get('votes_malicious', 0)} malicious / {vt.get('votes_harmless', 0)} harmless\nTags: {', '.join(vt.get('tags', [])[:5]) or 'none'}"])
+        if report.shodan:
+            sh = report.shodan
+            intel_rows.append(['Shodan Host Intelligence',
+                               f"IP: {sh.get('ip', 'unknown')}\nOpen ports: {len(sh.get('ports', []))}\nVulnerabilities: {len(sh.get('vulns', []))}",
+                               f"Organization: {sh.get('org', 'unknown')}\nISP: {sh.get('isp', 'unknown')}\nCountry: {sh.get('country', 'unknown')}"])
+        if intel_rows:
+            story.append(table([['SOURCE', 'METADATA', 'DETAILS']] + intel_rows, [150, 174, 175]))
     story += [PageBreak(), p('02 / Findings & remediation', 'SectionV')]
     if not report.findings:
         story.append(p('No findings were produced within this assessment scope. Review coverage notes before drawing conclusions.'))
@@ -2078,7 +2276,7 @@ def render_ui():
             st.dataframe(report.coverage, hide_index=True, use_container_width=True)
             with st.expander('Response policy observations'):
                 st.dataframe(report.checks, hide_index=True, use_container_width=True)
-            st.caption(f'NVD: {report.nvd_status} · OSV: {report.osv_status} · CISA KEV: {report.kev_status}')
+            st.caption(f'NVD: {report.nvd_status} · OSV: {report.osv_status} · CISA KEV: {report.kev_status} · VirusTotal: {report.virustotal_status} · Shodan: {report.shodan_status}')
             for note in dict.fromkeys(report.notes):
                 st.text('• ' + note)
         with tabs[4]:
